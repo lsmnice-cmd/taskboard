@@ -160,13 +160,39 @@
   }
   .task .txt{
     flex:1; font-size:13.5px; line-height:1.45; word-break:break-word; cursor:text;
-    border-radius:5px; padding:0 2px;
+    border-radius:5px; padding:0 2px; white-space:pre-wrap;
   }
   .task .txt:focus{outline:2px solid var(--accent); background:#fff;}
   .task.done .txt{color:var(--ink-soft); text-decoration:line-through;}
   .task .icon-btn{width:24px; height:24px; font-size:13px; opacity:0; transition:opacity .1s;}
   .task:hover .icon-btn{opacity:1;}
   @media (hover:none){ .task .icon-btn{opacity:1;} }
+
+  /* 할 일 이동 그립 */
+  .task .grip{
+    width:14px; flex:none; color:#c3ccd8; cursor:grab; font-size:12px;
+    letter-spacing:-2px; opacity:0; user-select:none; margin-top:2px; text-align:center;
+  }
+  .task:hover .grip{opacity:1;}
+  .task .grip:hover{color:var(--accent);}
+  @media (hover:none){ .task .grip{opacity:.6;} }
+
+  /* 하위 할 일 */
+  .task.sub{margin-left:26px; padding:4px 6px 4px 8px;}
+  .task.sub .txt{font-size:12.5px;}
+  .task.sub input[type=checkbox]{width:15px; height:15px;}
+  .task.sub input[type=checkbox]:checked::after{font-size:10px; top:-1px; left:1.5px;}
+
+  /* 드래그 중 표시 */
+  .task-ghost{
+    position:fixed; z-index:200; pointer-events:none;
+    background:#fff; border:1.5px solid var(--accent); border-radius:9px;
+    padding:6px 12px; font-size:13px; font-weight:600; color:var(--ink);
+    box-shadow:var(--shadow-lift); max-width:260px; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; transform:translate(-50%,-130%);
+  }
+  .list-card.drop-target{outline:2px dashed var(--accent); outline-offset:2px;}
+  .task.drop-before{box-shadow:0 -2px 0 var(--accent);}
 
   .add-row{
     display:flex; gap:6px; padding:8px 12px 12px;
@@ -294,13 +320,13 @@
    Firebase 콘솔 → 프로젝트 설정 → 일반 → 내 앱 → SDK 설정
    ========================================================= */
 var firebaseConfig = {
-  apiKey: "AIzaSyBEkUxvKO5cu-F2zyMzeAqZJ2cCt2NEItM",
-  authDomain: "taskboard-95fbe.firebaseapp.com",
-  databaseURL: "https://taskboard-95fbe-default-rtdb.firebaseio.com",
-  projectId: "taskboard-95fbe",
-  storageBucket: "taskboard-95fbe.firebasestorage.app",
-  messagingSenderId: "811367008397",
-  appId: "1:811367008397:web:a12319f0471f2dc46e3ac4"
+  apiKey: "여기에_apiKey",
+  authDomain: "여기에_authDomain",
+  databaseURL: "여기에_databaseURL",
+  projectId: "여기에_projectId",
+  storageBucket: "여기에_storageBucket",
+  messagingSenderId: "여기에_messagingSenderId",
+  appId: "여기에_appId"
 };
 /* ========================================================= */
 
@@ -313,6 +339,8 @@ var firebaseConfig = {
   var SNAP_M = 14;   /* 붙었을 때 카드 사이 간격 */
   var SNAP_T = 16;   /* 자석 감지 거리 (보드 좌표) */
   var DB_PATH = "taskboard/data";
+  var INBOX_PATH = "taskboard/inbox";       /* 파이썬 리포트가 들어오는 경로 */
+  var INBOX_LIST_TITLE = "📥 리포트";        /* 리포트가 쌓일 목록 이름 */
 
   var state = { lists: [], nextColor: 0 };
   var view  = { x: 60, y: 40, scale: 1 };
@@ -328,10 +356,75 @@ var firebaseConfig = {
 
   /* ---------- Firebase 초기화 ---------- */
   var CLIENT_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
-  var db = null, dbRef = null;
+  var db = null, dbRef = null, inboxRef = null;
   var memoryOnly = false;
   var pendingRemote = null;
   var firstSnapshot = true;
+  var appReady = false;
+  var inboxQueue = [];
+
+  /* ---------- 파이썬 리포트 인박스 처리 ---------- */
+  function onInboxItem(snap){
+    var item = {key: snap.key, val: snap.val()};
+    if(!appReady){ inboxQueue.push(item); return; }
+    processInboxItem(item);
+  }
+
+  function hasTaskFromInbox(key){
+    return state.lists.some(function(l){
+      return (l.tasks||[]).some(function(t){ return t.src === key; });
+    });
+  }
+
+  function processInboxItem(item){
+    var v = item.val || {};
+    var text = typeof v === "string" ? v : (v.text || "");
+    if(!text){ db.ref(INBOX_PATH+"/"+item.key).remove(); return; }
+
+    /* 이미 다른 기기에서 처리한 항목이면 제거만 */
+    if(hasTaskFromInbox(item.key)){
+      db.ref(INBOX_PATH+"/"+item.key).remove();
+      return;
+    }
+
+    /* 리포트 목록 찾기 (없으면 기존 카드 오른쪽에 자동 생성) */
+    var list = state.lists.find(function(l){ return l.title === INBOX_LIST_TITLE; });
+    if(!list){
+      var maxX = 0, minY = 0;
+      state.lists.forEach(function(l){
+        maxX = Math.max(maxX, l.x + l.w);
+        minY = Math.min(minY, l.y);
+      });
+      list = {
+        id: uid(), title: INBOX_LIST_TITLE,
+        color: "#0f766e",
+        x: state.lists.length ? maxX + GAP : 0,
+        y: state.lists.length ? minY : 0,
+        w: DEF_W, h: DEF_H, doneOpen: false, tasks: []
+      };
+      state.lists.push(list);
+    }
+
+    list.tasks = list.tasks || [];
+    var prefix = v.source ? "["+v.source+"] " : "";
+    list.tasks.unshift({
+      id: uid(),
+      text: prefix + text,
+      done: false,
+      src: item.key,
+      at: v.createdAt || Date.now()
+    });
+
+    render(); scheduleSave();
+    saveEl.textContent = "리포트 메모 추가됨";
+    db.ref(INBOX_PATH+"/"+item.key).remove();
+  }
+
+  function flushInboxQueue(){
+    appReady = true;
+    var q = inboxQueue; inboxQueue = [];
+    q.forEach(processInboxItem);
+  }
 
   function configFilled(){
     return firebaseConfig && String(firebaseConfig.apiKey).indexOf("여기에") !== 0;
@@ -393,6 +486,8 @@ var firebaseConfig = {
               alert("데이터 접근이 거부되었습니다.\n허용된 이메일 계정인지, Realtime Database 규칙을 확인하세요.\n(" + err.message + ")");
               firebase.auth().signOut();
             });
+            inboxRef = db.ref(INBOX_PATH);
+            inboxRef.on("child_added", onInboxItem);
           }
         }else{
           loginOverlay.classList.add("show");
@@ -400,8 +495,10 @@ var firebaseConfig = {
           logoutBtn.style.display = "none";
           if(started){
             dbRef.off("value", onRemote);
+            if(inboxRef) inboxRef.off("child_added", onInboxItem);
             started = false;
             firstSnapshot = true;
+            appReady = false;
           }
         }
       });
@@ -452,7 +549,9 @@ var firebaseConfig = {
     state.lists.forEach(function(l){
       if(!l.w) l.w = DEF_W;
       if(!l.h) l.h = DEF_H;
+      /* hMax는 사용자가 위/아래 변을 조절했을 때만 생김 (없으면 자유롭게 자람) */
       if(!l.tasks) l.tasks = [];
+      l.tasks.forEach(function(t){ if(!t.subs) t.subs = []; });
     });
   }
 
@@ -515,6 +614,25 @@ var firebaseConfig = {
 
   /* ---------- 렌더링 ---------- */
   var EDGES = ["n","s","e","w","ne","nw","se","sw"];
+
+  function taskRow(t){
+    var html = '<div class="task'+(t.done?' done':'')+'" data-tid="'+t.id+'">'
+      + '<span class="grip" title="끌어서 다른 목록으로 이동">⠿</span>'
+      + '<input type="checkbox"'+(t.done?' checked':'')+'>'
+      + '<div class="txt" contenteditable="true" spellcheck="false">'+esc(t.text)+'</div>'
+      + '<button class="icon-btn" data-act="addSub" title="하위 할 일 추가">＋</button>'
+      + '<button class="icon-btn del" data-act="delTask" title="삭제">✕</button>'
+      + '</div>';
+    (t.subs || []).forEach(function(s){
+      html += '<div class="task sub'+(s.done?' done':'')+'" data-tid="'+t.id+'" data-sid="'+s.id+'">'
+        + '<input type="checkbox"'+(s.done?' checked':'')+'>'
+        + '<div class="txt" contenteditable="true" spellcheck="false">'+esc(s.text)+'</div>'
+        + '<button class="icon-btn del" data-act="delTask" title="삭제">✕</button>'
+        + '</div>';
+    });
+    return html;
+  }
+
   function render(){
     board.innerHTML = "";
     emptyEl.style.display = state.lists.length ? "none" : "block";
@@ -526,7 +644,6 @@ var firebaseConfig = {
       card.style.left = list.x + "px";
       card.style.top  = list.y + "px";
       card.style.width  = list.w + "px";
-      card.style.height = list.h + "px";
       card.style.borderTopColor = list.color;
 
       var tasks = list.tasks || [];
@@ -541,25 +658,13 @@ var firebaseConfig = {
       html += '<div class="task-count">할 일 '+active.length+'개'+(done.length? ' · 완료 '+done.length+'개':'')+'</div>';
       html += '<div class="list-body">';
 
-      active.forEach(function(t){
-        html += '<div class="task" data-tid="'+t.id+'">'
-              + '<input type="checkbox">'
-              + '<div class="txt" contenteditable="true" spellcheck="false">'+esc(t.text)+'</div>'
-              + '<button class="icon-btn del" data-act="delTask" title="삭제">✕</button>'
-              + '</div>';
-      });
+      active.forEach(function(t){ html += taskRow(t); });
 
       if(done.length){
         html += '<div class="done-toggle'+(list.doneOpen?' open':'')+'" data-act="toggleDone">'
               + '<span class="tri">▶</span> 완료됨('+done.length+'개)</div>';
         html += '<div class="done-section'+(list.doneOpen?' open':'')+'">';
-        done.forEach(function(t){
-          html += '<div class="task done" data-tid="'+t.id+'">'
-                + '<input type="checkbox" checked>'
-                + '<div class="txt" contenteditable="true" spellcheck="false">'+esc(t.text)+'</div>'
-                + '<button class="icon-btn del" data-act="delTask" title="삭제">✕</button>'
-                + '</div>';
-        });
+        done.forEach(function(t){ html += taskRow(t); });
         html += '</div>';
       }
 
@@ -576,7 +681,34 @@ var firebaseConfig = {
       card.innerHTML = html;
       board.appendChild(card);
     });
+    applyLimits();
     drawMinimap();
+  }
+
+  /* 내용에 따라 카드가 아래로 자라고, 아래에 다른 카드가 있거나
+     지정한 최대 높이에 닿으면 그때부터 내부 스크롤로 전환 */
+  function applyLimits(){
+    state.lists.forEach(function(l){
+      var el = board.querySelector('[data-id="'+l.id+'"]');
+      if(!el) return;
+      var cap = l.hMax || MAX_H;              /* 사용자가 위/아래 변으로 지정한 상한 */
+      var space = Infinity;                    /* 바로 아래 카드까지 남은 공간 */
+      state.lists.forEach(function(o){
+        if(o === l) return;
+        var overlapX = (o.x < l.x + l.w) && (o.x + o.w > l.x);
+        if(overlapX && o.y > l.y){
+          space = Math.min(space, o.y - l.y - SNAP_M);
+        }
+      });
+      var maxH = clamp(Math.min(cap, space), MIN_H, MAX_H);
+      el.style.minHeight = MIN_H + "px";
+      el.style.maxHeight = maxH + "px";
+    });
+    /* 실제 표시 높이를 상태에 반영 (자석 스냅·미니맵 계산용) */
+    state.lists.forEach(function(l){
+      var el = board.querySelector('[data-id="'+l.id+'"]');
+      if(el) l.h = el.offsetHeight;
+    });
   }
 
   /* ---------- 카드 내부 이벤트 (위임) ---------- */
@@ -584,9 +716,17 @@ var firebaseConfig = {
     var card = e.target.closest(".list-card"); if(!card) return;
     var list = state.lists.find(function(l){return l.id===card.dataset.id;});
     if(e.target.matches('input[type=checkbox]')){
-      var tid = e.target.closest(".task").dataset.tid;
-      var t = list.tasks.find(function(x){return x.id===tid;});
-      t.done = e.target.checked;
+      var row = e.target.closest(".task");
+      var t = list.tasks.find(function(x){return x.id===row.dataset.tid;});
+      if(!t) return;
+      if(row.dataset.sid){
+        var s = (t.subs||[]).find(function(x){return x.id===row.dataset.sid;});
+        if(s) s.done = e.target.checked;
+      }else{
+        t.done = e.target.checked;
+        /* 상위를 완료하면 하위도 함께 완료 처리 */
+        if(t.done) (t.subs||[]).forEach(function(s){ s.done = true; });
+      }
       render(); scheduleSave();
     }
   });
@@ -602,9 +742,24 @@ var firebaseConfig = {
         render(); scheduleSave();
       }
     }else if(act==="delTask"){
-      var tid = e.target.closest(".task").dataset.tid;
-      list.tasks = list.tasks.filter(function(t){return t.id!==tid;});
+      var row = e.target.closest(".task");
+      if(row.dataset.sid){
+        var pt = list.tasks.find(function(t){return t.id===row.dataset.tid;});
+        if(pt) pt.subs = (pt.subs||[]).filter(function(s){return s.id!==row.dataset.sid;});
+      }else{
+        list.tasks = list.tasks.filter(function(t){return t.id!==row.dataset.tid;});
+      }
       render(); scheduleSave();
+    }else if(act==="addSub"){
+      var prow = e.target.closest(".task");
+      var pt2 = list.tasks.find(function(t){return t.id===prow.dataset.tid;});
+      if(!pt2) return;
+      pt2.subs = pt2.subs || [];
+      var ns = {id:uid(), text:"", done:false};
+      pt2.subs.push(ns);
+      render();
+      var el = board.querySelector('[data-sid="'+ns.id+'"] .txt');
+      if(el){ el.focus(); }
     }else if(e.target.closest('[data-act="toggleDone"]')){
       list.doneOpen = !list.doneOpen;
       render(); scheduleSave();
@@ -631,11 +786,23 @@ var firebaseConfig = {
       list.title = e.target.value.trim() || "제목 없음";
       scheduleSave(); drawMinimap();
     }else if(e.target.matches(".txt")){
-      var tid = e.target.closest(".task").dataset.tid;
-      var t = list.tasks.find(function(x){return x.id===tid;});
+      var row = e.target.closest(".task");
+      var t = list.tasks.find(function(x){return x.id===row.dataset.tid;});
+      if(!t) return;
       var v = e.target.textContent.trim();
-      if(v && t){ t.text = v; scheduleSave(); }
-      else if(t){ e.target.textContent = t.text; }
+      if(row.dataset.sid){
+        var s = (t.subs||[]).find(function(x){return x.id===row.dataset.sid;});
+        if(!s) return;
+        if(v){ s.text = v; scheduleSave(); }
+        else{
+          /* 내용 없이 벗어나면 하위 할 일 제거 */
+          t.subs = t.subs.filter(function(x){return x!==s;});
+          render(); scheduleSave();
+        }
+      }else{
+        if(v){ t.text = v; scheduleSave(); }
+        else{ e.target.textContent = t.text; }
+      }
     }
     setTimeout(flushPendingRemote, 50);
   });
@@ -679,6 +846,11 @@ var firebaseConfig = {
   }
 
   viewport.addEventListener("wheel", function(e){
+    /* 카드 내부에 스크롤할 내용이 있으면 내부 스크롤 우선 */
+    var bodyEl = e.target.closest ? e.target.closest(".list-body") : null;
+    if(bodyEl && !e.ctrlKey && !e.metaKey && bodyEl.scrollHeight > bodyEl.clientHeight){
+      return;
+    }
     e.preventDefault();
     if(e.ctrlKey || e.metaKey){
       var vr = viewport.getBoundingClientRect();
@@ -756,6 +928,29 @@ var firebaseConfig = {
       return;
     }
 
+    var grip = e.target.closest(".grip");
+    if(grip){
+      var taskEl = grip.closest(".task");
+      if(taskEl && !taskEl.dataset.sid){
+        var cardG = taskEl.closest(".list-card");
+        var listG = state.lists.find(function(l){return l.id===cardG.dataset.id;});
+        var taskG = listG.tasks.find(function(t){return t.id===taskEl.dataset.tid;});
+        if(taskG){
+          var ghost = document.createElement("div");
+          ghost.className = "task-ghost";
+          ghost.textContent = taskG.text;
+          ghost.style.left = e.clientX + "px";
+          ghost.style.top  = e.clientY + "px";
+          document.body.appendChild(ghost);
+          drag = {type:"task", task:taskG, fromList:listG, ghost:ghost,
+                  targetListId:null, targetTid:null};
+          viewport.setPointerCapture(e.pointerId);
+          e.preventDefault();
+          return;
+        }
+      }
+    }
+
     var head = e.target.closest(".list-head");
     if(head && !e.target.matches("input,button")){
       var cardEl2 = head.closest(".list-card");
@@ -776,6 +971,27 @@ var firebaseConfig = {
   viewport.addEventListener("pointermove", function(e){
     if(!drag) return;
     var dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+
+    if(drag.type === "task"){
+      drag.ghost.style.left = e.clientX + "px";
+      drag.ghost.style.top  = e.clientY + "px";
+      /* 포인터 아래의 목록/할일 감지 */
+      board.querySelectorAll(".drop-target").forEach(function(el){el.classList.remove("drop-target");});
+      board.querySelectorAll(".drop-before").forEach(function(el){el.classList.remove("drop-before");});
+      var under = document.elementFromPoint(e.clientX, e.clientY);
+      var overCard = under && under.closest ? under.closest(".list-card") : null;
+      var overTask = under && under.closest ? under.closest(".task") : null;
+      drag.targetListId = null; drag.targetTid = null;
+      if(overCard){
+        drag.targetListId = overCard.dataset.id;
+        overCard.classList.add("drop-target");
+        if(overTask && !overTask.dataset.sid && overTask.dataset.tid !== drag.task.id){
+          drag.targetTid = overTask.dataset.tid;
+          overTask.classList.add("drop-before");
+        }
+      }
+      return;
+    }
 
     if(drag.type === "pan"){
       view.x = drag.ox + dx; view.y = drag.oy + dy;
@@ -814,24 +1030,56 @@ var firebaseConfig = {
         h = drag.oy + drag.oh - top; y = top;
       }
 
-      l.x=x; l.y=y; l.w=w; l.h=h;
+      l.x=x; l.y=y; l.w=w;
+      if(drag.s || drag.n) l.hMax = h;   /* 위/아래 조절 = 최대 높이 지정 */
       drag.el.style.left = x+"px";  drag.el.style.top = y+"px";
-      drag.el.style.width = w+"px"; drag.el.style.height = h+"px";
+      drag.el.style.width = w+"px";
+      if(drag.s || drag.n){
+        drag.el.style.maxHeight = h+"px";
+        drag.el.style.height = h+"px";   /* 조절 중에는 눈에 보이게 고정 */
+      }
       drawMinimap();
     }
   });
 
   function endDrag(){
     if(!drag) return;
-    var wasCardOrResize = (drag.type !== "pan");
-    if(drag.el){
-      drag.el.classList.remove("dragging");
-      drag.el.classList.remove("snapped");
+    var d = drag; drag = null;
+
+    if(d.type === "task"){
+      d.ghost.remove();
+      board.querySelectorAll(".drop-target").forEach(function(el){el.classList.remove("drop-target");});
+      board.querySelectorAll(".drop-before").forEach(function(el){el.classList.remove("drop-before");});
+      if(d.targetListId){
+        var toList = state.lists.find(function(l){return l.id===d.targetListId;});
+        if(toList){
+          var fi = d.fromList.tasks.indexOf(d.task);
+          if(fi > -1) d.fromList.tasks.splice(fi, 1);
+          var idx = toList.tasks.length;
+          if(d.targetTid){
+            var ti = toList.tasks.findIndex(function(t){return t.id===d.targetTid;});
+            if(ti > -1) idx = ti;
+          }
+          toList.tasks.splice(idx, 0, d.task);
+          render(); scheduleSave();
+        }
+      }
+      setTimeout(flushPendingRemote, 500);
+      return;
+    }
+
+    if(d.el){
+      d.el.classList.remove("dragging");
+      d.el.classList.remove("snapped");
+      d.el.style.height = "";           /* 자동 높이로 복귀 */
     }
     viewport.classList.remove("panning");
-    drag = null;
-    if(wasCardOrResize) scheduleSave();
-    else saveView();
+    if(d.type !== "pan"){
+      render();                          /* 위치·크기 변경에 따라 높이 제한 재계산 */
+      scheduleSave();
+    }else{
+      saveView();
+    }
     setTimeout(flushPendingRemote, 500);
   }
   viewport.addEventListener("pointerup", endDrag);
@@ -938,6 +1186,7 @@ var firebaseConfig = {
       if(!memoryOnly) doSave();
     }
     render(); applyView();
+    if(!memoryOnly) flushInboxQueue();
   }
 
   initFirebase();
